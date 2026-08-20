@@ -125,6 +125,68 @@ def make_drm_info(muid: str, country: str, area: str, group_id: str) -> str:
 def get_country_info(country_code: str) -> dict:
     return COUNTRY_INFO.get(country_code.lower(), COUNTRY_INFO[DEFAULT_COUNTRY])
 
+# ─── Proxy helper ──────────────────────────────────────────────────
+
+def parse_proxy_url(proxy_str: str) -> str:
+    """
+    Parse proxy string and return a proper proxy URL for requests.
+    Supports formats:
+    1. user:pass@host:port
+    2. host:port:user:pass
+    3. http://user:pass@host:port
+    """
+    if not proxy_str:
+        return None
+    
+    proxy_str = proxy_str.strip()
+    
+    # If it already has http:// or https://, return as-is
+    if proxy_str.startswith(('http://', 'https://')):
+        return proxy_str
+    
+    # Format 1: user:pass@host:port
+    if '@' in proxy_str:
+        parts = proxy_str.split('@')
+        if len(parts) == 2:
+            auth = parts[0]
+            host_port = parts[1]
+            user_pass = auth.split(':', 1)
+            if len(user_pass) == 2:
+                user = user_pass[0]
+                password = user_pass[1]
+                return f"http://{user}:{password}@{host_port}"
+    
+    # Format 2: host:port:user:pass
+    if ':' in proxy_str:
+        parts = proxy_str.split(':')
+        if len(parts) >= 4:
+            host = parts[0]
+            port = parts[1]
+            user = parts[2]
+            password = ':'.join(parts[3:])  # In case password contains colons
+            
+            # Validate port is a number
+            try:
+                int(port)
+                return f"http://{user}:{password}@{host}:{port}"
+            except ValueError:
+                pass
+    
+    # If we can't parse it, return as-is (might still work)
+    return f"http://{proxy_str}"
+
+def create_session(proxy_url: str = None):
+    """Create a session with optional proxy support"""
+    session = requests.Session(impersonate="chrome120")
+    if proxy_url:
+        proxy_url = parse_proxy_url(proxy_url)
+        if proxy_url:
+            session.proxies = {
+                'http': proxy_url,
+                'https': proxy_url
+            }
+    return session
+
 # ─── Get fresh ctoken from page ────────────────────────────────────
 
 def get_fresh_ctoken(session, country: str) -> dict:
@@ -166,11 +228,11 @@ def get_fresh_ctoken(session, country: str) -> dict:
 
 # ─── Main lookup functions ─────────────────────────────────────────
 
-def lookup_pubg_id(pubg_id: str, country: str = "us") -> dict:
-    """Look up PUBG player info using fresh token"""
+def lookup_pubg_id(pubg_id: str, country: str = "us", proxy_url: str = None) -> dict:
+    """Look up PUBG player info using fresh token with optional proxy"""
     try:
-        # Create session with impersonation
-        session = requests.Session(impersonate="chrome120")
+        # Create session with optional proxy
+        session = create_session(proxy_url)
         
         # Generate IDs
         device_id = gen_device_id()
@@ -239,7 +301,7 @@ def lookup_pubg_id(pubg_id: str, country: str = "us") -> dict:
         buy_ref = f"https://www.midasbuy.com/midasbuy/{country}/buy/pubgm?from=self.midasbuy_saas"
         response = session.post(
             CHARACTER_API_URL,
-            data=encrypted_body,  # Use data= not json=
+            data=encrypted_body,
             headers={
                 **get_headers(buy_ref),
                 "Content-Type": "application/json"
@@ -260,7 +322,7 @@ def lookup_pubg_id(pubg_id: str, country: str = "us") -> dict:
                 "register_country": info.get("register_country"),
                 "is_banned": bool(info.get("is_ban")),
                 "country_used": country,
-                "raw": result
+                "proxy_used": bool(proxy_url)
             }
         
         return {
@@ -268,7 +330,7 @@ def lookup_pubg_id(pubg_id: str, country: str = "us") -> dict:
             "error": result.get("msg", "Account not found"),
             "ret": result.get("ret"),
             "country_used": country,
-            "raw": result
+            "proxy_used": bool(proxy_url)
         }
         
     except Exception as e:
@@ -276,14 +338,15 @@ def lookup_pubg_id(pubg_id: str, country: str = "us") -> dict:
         traceback.print_exc()
         return {
             "success": False,
-            "error": f"Request failed: {str(e)}"
+            "error": f"Request failed: {str(e)}",
+            "proxy_used": bool(proxy_url)
         }
 
-def lookup_redeem_code(redeem_code: str, open_id: str, country: str = "us") -> dict:
-    """Look up redeem code info using fresh token"""
+def lookup_redeem_code(redeem_code: str, open_id: str, country: str = "us", proxy_url: str = None) -> dict:
+    """Look up redeem code info using fresh token with optional proxy"""
     try:
-        # Create session with impersonation
-        session = requests.Session(impersonate="chrome120")
+        # Create session with optional proxy
+        session = create_session(proxy_url)
         
         # Generate IDs
         device_id = gen_device_id()
@@ -367,7 +430,7 @@ def lookup_redeem_code(redeem_code: str, open_id: str, country: str = "us") -> d
         buy_ref = f"https://www.midasbuy.com/midasbuy/{country}/buy/pubgm?from=self.midasbuy_saas"
         response = session.post(
             REDEEM_API_URL,
-            data=encrypted_body,  # Use data= not json=
+            data=encrypted_body,
             headers={
                 **get_headers(buy_ref),
                 "Content-Type": "application/json"
@@ -398,9 +461,9 @@ def lookup_redeem_code(redeem_code: str, open_id: str, country: str = "us") -> d
                 })
             
             return {
-                "raw": result,
                 "success": True,
                 "country_used": country,
+                "proxy_used": bool(proxy_url),
                 "redeem_code_info": {
                     "game_name": info.get("game_name", "N/A"),
                     "coin_name": info.get("coin_name", "N/A"),
@@ -417,16 +480,16 @@ def lookup_redeem_code(redeem_code: str, open_id: str, country: str = "us") -> d
             "error": result.get("msg", "Unknown error"),
             "ret": result.get("ret"),
             "country_used": country,
-            "raw": result
+            "proxy_used": bool(proxy_url)
         }
         
     except Exception as e:
         import traceback
         traceback.print_exc()
         return {
-            "raw": result,
             "success": False,
-            "error": f"Request failed: {str(e)}"
+            "error": f"Request failed: {str(e)}",
+            "proxy_used": bool(proxy_url)
         }
 
 # ─── Flask Routes ──────────────────────────────────────────────────
@@ -436,9 +499,15 @@ def docs():
     """API Documentation endpoint"""
     return jsonify({
         "service": "PUBG Mobile Redeem Code API",
-        "version": "2.1.0",
-        "description": "Uses fresh ctoken generation from MidasBuy page - fixed encryption",
+        "version": "2.2.0",
+        "description": "Uses fresh ctoken generation from MidasBuy page with proxy support",
         "region": "Auto-detected from MidasBuy",
+        "features": [
+            "Fresh token generation for each request",
+            "Optional proxy support",
+            "Multiple country support",
+            "Automatic country detection"
+        ],
         "endpoints": {
             "/": {
                 "methods": ["GET"],
@@ -458,10 +527,21 @@ def docs():
                         "required": False,
                         "description": "Country code (us, bd, tr, etc.)",
                         "default": "us"
+                    },
+                    "proxy": {
+                        "type": "string",
+                        "required": False,
+                        "description": "Proxy URL (optional). Formats: user:pass@host:port OR host:port:user:pass",
+                        "examples": [
+                            "user:pass@proxy.example.com:8080",
+                            "proxy.example.com:8080:user:pass",
+                            "http://user:pass@proxy.example.com:8080"
+                        ]
                     }
                 },
                 "examples": {
-                    "GET": "/playerInfo?pubg_id=1234567890&country=us"
+                    "GET": "/playerInfo?pubg_id=1234567890&country=us",
+                    "GET with proxy": "/playerInfo?pubg_id=1234567890&country=us&proxy=user:pass@proxy.example.com:8080"
                 }
             },
             "/codeInfo": {
@@ -483,10 +563,20 @@ def docs():
                         "required": False,
                         "description": "Country code (us, bd, tr, etc.)",
                         "default": "us"
+                    },
+                    "proxy": {
+                        "type": "string",
+                        "required": False,
+                        "description": "Proxy URL (optional). Formats: user:pass@host:port OR host:port:user:pass",
+                        "examples": [
+                            "user:pass@proxy.example.com:8080",
+                            "proxy.example.com:8080:user:pass"
+                        ]
                     }
                 },
                 "examples": {
-                    "GET": "/codeInfo?open_id=1234567890&redeem_code=CODE123&country=us"
+                    "GET": "/codeInfo?open_id=1234567890&redeem_code=CODE123&country=us",
+                    "GET with proxy": "/codeInfo?open_id=1234567890&redeem_code=CODE123&country=us&proxy=user:pass@proxy.example.com:8080"
                 }
             }
         }
@@ -494,20 +584,23 @@ def docs():
 
 @app.route('/playerInfo', methods=['GET', 'POST'])
 def get_player_info():
-    """Get player information by PUBG ID"""
+    """Get player information by PUBG ID with optional proxy"""
     try:
         # Extract pubg_id from request
         if request.method == 'GET':
             pubg_id = request.args.get('pubg_id')
             country = request.args.get('country', 'us')
+            proxy = request.args.get('proxy')
         else:
             if request.is_json:
                 data = request.json
                 pubg_id = data.get('pubg_id')
                 country = data.get('country', 'us')
+                proxy = data.get('proxy')
             else:
                 pubg_id = request.form.get('pubg_id')
                 country = request.form.get('country', 'us')
+                proxy = request.form.get('proxy')
         
         # Validation
         if not pubg_id:
@@ -522,8 +615,8 @@ def get_player_info():
                 "error": "Invalid PUBG ID! Must be numeric"
             }), 400
         
-        # Look up character info
-        result = lookup_pubg_id(pubg_id, country)
+        # Look up character info with optional proxy
+        result = lookup_pubg_id(pubg_id, country, proxy)
         
         if result.get("success"):
             return jsonify({
@@ -535,7 +628,8 @@ def get_player_info():
                 "success": False,
                 "error": result.get("error", "Account not found"),
                 "ret": result.get("ret"),
-                "country_used": result.get("country_used")
+                "country_used": result.get("country_used"),
+                "proxy_used": result.get("proxy_used", False)
             }), 404
             
     except Exception as e:
@@ -548,23 +642,26 @@ def get_player_info():
 
 @app.route('/codeInfo', methods=['GET', 'POST'])
 def get_code_info():
-    """Get redeem code information"""
+    """Get redeem code information with optional proxy"""
     try:
         # Extract parameters from request
         if request.method == 'GET':
             open_id = request.args.get('open_id')
             redeem_code = request.args.get('redeem_code')
             country = request.args.get('country', 'us')
+            proxy = request.args.get('proxy')
         else:
             if request.is_json:
                 data = request.json
                 open_id = data.get('open_id')
                 redeem_code = data.get('redeem_code')
                 country = data.get('country', 'us')
+                proxy = data.get('proxy')
             else:
                 open_id = request.form.get('open_id')
                 redeem_code = request.form.get('redeem_code')
                 country = request.form.get('country', 'us')
+                proxy = request.form.get('proxy')
         
         # Validation
         if not open_id:
@@ -579,8 +676,8 @@ def get_code_info():
                 "error": "Missing redeem_code parameter"
             }), 400
         
-        # Look up redeem code info
-        result = lookup_redeem_code(redeem_code, open_id, country)
+        # Look up redeem code info with optional proxy
+        result = lookup_redeem_code(redeem_code, open_id, country, proxy)
         
         if result.get("success"):
             return jsonify({
@@ -592,7 +689,8 @@ def get_code_info():
                 "success": False,
                 "error": result.get("error", "Redeem code not found"),
                 "ret": result.get("ret"),
-                "country_used": result.get("country_used")
+                "country_used": result.get("country_used"),
+                "proxy_used": result.get("proxy_used", False)
             }), 404
             
     except Exception as e:
@@ -619,9 +717,17 @@ def method_not_allowed(error):
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("PUBG Mobile Redeem Code API Server (v2.1 - Fixed Encryption)")
+    print("PUBG Mobile Redeem Code API Server (v2.2 - Proxy Support)")
     print("=" * 60)
-    print("This API fetches fresh ctoken from MidasBuy page")
-    print("Fixed: encrypt_msg is invalid error")
+    print("Features:")
+    print("  - Fresh ctoken generation for each request")
+    print("  - Optional proxy support")
+    print("  - Multiple country support")
+    print("  - Automatic country detection")
+    print("=" * 60)
+    print("\nProxy formats supported:")
+    print("  1. user:pass@host:port")
+    print("  2. host:port:user:pass")
+    print("  3. http://user:pass@host:port")
     print("=" * 60)
     app.run(host='0.0.0.0', port=5000, debug=True)
