@@ -259,14 +259,16 @@ def lookup_pubg_id(pubg_id: str, country: str = "us") -> dict:
                 "active_country": info.get("active_country"),
                 "register_country": info.get("register_country"),
                 "is_banned": bool(info.get("is_ban")),
-                "country_used": country
+                "country_used": country,
+                "raw": result
             }
         
         return {
             "success": False,
             "error": result.get("msg", "Account not found"),
             "ret": result.get("ret"),
-            "country_used": country
+            "country_used": country,
+            "raw": result
         }
         
     except Exception as e:
@@ -396,6 +398,7 @@ def lookup_redeem_code(redeem_code: str, open_id: str, country: str = "us") -> d
                 })
             
             return {
+                "raw": result,
                 "success": True,
                 "country_used": country,
                 "redeem_code_info": {
@@ -413,13 +416,15 @@ def lookup_redeem_code(redeem_code: str, open_id: str, country: str = "us") -> d
             "success": False,
             "error": result.get("msg", "Unknown error"),
             "ret": result.get("ret"),
-            "country_used": country
+            "country_used": country,
+            "raw": result
         }
         
     except Exception as e:
         import traceback
         traceback.print_exc()
         return {
+            "raw": result,
             "success": False,
             "error": f"Request failed: {str(e)}"
         }
