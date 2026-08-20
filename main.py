@@ -7,18 +7,40 @@ import json
 import random
 import time
 import string
+import re
+import hashlib
+import os
 from urllib.parse import unquote
 
 app = Flask(__name__)
 
+# ─── Constants ──────────────────────────────────────────────────────
+
 STATIC_KEY = bytes.fromhex("e044ac6cda6be680b412e4437a20b9541709228fbbed7bf8af6731a01f9f0bca")
 STATIC_IV = b"1234567890123456"
-XMIDAS_TOKEN = "ae7c5c58eef7eb132575e9e9130f1bd700b5855d6f939e1eca3080808f209a581cd2acf22552228b5dfe2e278031a4d2"
+APPID = "1450015065"
+SHOP_CODE = "midasbuy"
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+XMIDAS_SDK_URL = "https://www.midasbuy.com/xmidas-sdk.js"
 CHARACTER_API_URL = "https://www.midasbuy.com/interface/getCharac"
 REDEEM_API_URL = "https://www.midasbuy.com/interface/shelfProto/shelves_svr/QueryRedeemCodeInfo"
 
+COUNTRY_INFO = {
+    "us": {"currency": "USD", "area": "NorthAmerica", "group_id": "pubg_utp_new"},
+    "bd": {"currency": "BDT", "area": "SouthEastAsia", "group_id": "pubg_utp_new"},
+    "tr": {"currency": "TRY", "area": "Europe", "group_id": "pubg_utp_new"},
+    "gb": {"currency": "GBP", "area": "Europe", "group_id": "pubg_utp_new"},
+    "pk": {"currency": "PKR", "area": "SouthEastAsia", "group_id": "pubg_utp_new"},
+    "id": {"currency": "IDR", "area": "SouthEastAsia", "group_id": "pubg_utp_new"},
+}
+
+DEFAULT_COUNTRY = "us"
+
+# ─── Headers ────────────────────────────────────────────────────────
+
 HEADERS = {
-    'User-Agent': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    'User-Agent': UA,
     'Accept': "application/json, text/plain, */*",
     'Content-Type': "application/json",
     'Origin': "https://www.midasbuy.com",
@@ -33,188 +55,374 @@ HEADERS = {
     'Sec-Fetch-Site': 'same-origin',
 }
 
-def get_session_key(token):
-    raw = bytes.fromhex(token.strip())
-    cipher = AES.new(STATIC_KEY, AES.MODE_CBC, STATIC_IV)
-    return unpad(cipher.decrypt(raw), AES.block_size)
+# ─── Crypto helpers ────────────────────────────────────────────────
 
-def encrypt_payload(data, session_key):
-    plaintext = json.dumps(data).encode()
-    cipher = AES.new(session_key, AES.MODE_CBC, STATIC_IV)
-    ct = cipher.encrypt(pad(plaintext, AES.block_size))
-    return b64encode(ct).decode()
+def aes_decrypt(ciphertext: bytes, key: bytes, iv: bytes) -> bytes:
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    return unpad(cipher.decrypt(ciphertext), AES.block_size)
 
-def generate_params():
-    device_id = "015464057398" + ''.join([str(random.randint(0, 9)) for _ in range(18)])
-    timestamp = int(time.time() * 1000) + random.randint(-3600000, 3600000)
-    user_id = ''.join([str(random.randint(0, 9)) for _ in range(random.choice([17, 18, 19, 20]))])
-    pagetoken = b64encode(f"www.midasbuy.com_{timestamp}_{user_id}".encode()).decode()
-    tdrc_fp = ''.join([str(random.randint(0, 9)) for _ in range(35)])
-    muid = "U" + ''.join([random.choice(string.ascii_lowercase + string.digits) for _ in range(12)])
-    
-    return device_id, pagetoken, tdrc_fp, muid, user_id
+def aes_encrypt_b64(plaintext: bytes, key: bytes, iv: bytes) -> str:
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    return b64encode(cipher.encrypt(pad(plaintext, AES.block_size))).decode()
 
-def lookup_pubg_id(pubg_id):
-    session_key = get_session_key(XMIDAS_TOKEN)
-    device_id, pagetoken, tdrc_fp, muid, _ = generate_params()
+def session_key_from_ctoken(ctoken_hex: str) -> bytes:
+    return aes_decrypt(bytes.fromhex(ctoken_hex), STATIC_KEY, STATIC_IV)
+
+def make_encrypted_body(payload: dict, session_key: bytes, ctoken: str) -> str:
+    enc = aes_encrypt_b64(
+        json.dumps(payload, separators=(",", ":")).encode(),
+        session_key, STATIC_IV,
+    )
+    return json.dumps(
+        {"encrypt_msg": enc, "ctoken_ver": "1.0.1", "ctoken": ctoken},
+        separators=(",", ":"),
+    )
+
+# ─── Random ID generators ──────────────────────────────────────────
+
+def gen_device_id() -> str:
+    return "".join(str(random.randint(0, 9)) for _ in range(31))
+
+def gen_tdrc_fp() -> str:
+    return "".join(str(random.randint(0, 9)) for _ in range(35))
+
+def gen_muid() -> str:
+    return "U" + ''.join([random.choice(string.ascii_lowercase + string.digits) for _ in range(12)])
+
+def gen_user_id() -> str:
+    return ''.join([str(random.randint(0, 9)) for _ in range(random.choice([17, 18, 19, 20]))])
+
+def make_pagetoken(ts_ms: int, open_id: str = "") -> str:
+    return b64encode(f"www.midasbuy.com_{ts_ms}_{open_id}".encode()).decode()
+
+def make_exp_params(device_id: str, muid: str) -> str:
+    return b64encode(json.dumps(
+        {"exp_id": "", "exp_group_id": "", "scene_id": "midasbuy.new_ui",
+         "device_id": device_id, "shop_code": SHOP_CODE, "muid": muid},
+        separators=(",", ":"),
+    ).encode()).decode()
+
+def make_drm_info(muid: str, country: str, area: str, group_id: str) -> str:
+    return (
+        f"groupid=check_in&group_id={group_id}"
+        f"&area={area}&country={country.upper()}"
+        f"&muid={muid}&version=3.0&midasbuyArea={area}"
+    )
+
+def get_country_info(country_code: str) -> dict:
+    return COUNTRY_INFO.get(country_code.lower(), COUNTRY_INFO[DEFAULT_COUNTRY])
+
+# ─── Get fresh ctoken from page ────────────────────────────────────
+
+def get_fresh_ctoken(session, country: str) -> dict:
+    """Fetch a fresh ctoken from the MidasBuy page"""
+    buy_page_url = f"https://www.midasbuy.com/midasbuy/{country}/buy/pubgm?from=self.midasbuy_saas"
     
-    exp_params = b64encode(json.dumps({
-        "exp_id": "", "exp_group_id": "", "scene_id": "midasbuy.new_ui",
-        "device_id": device_id, "shop_code": "midasbuy", "muid": muid
-    }).encode()).decode()
+    # First try to get ctoken from the page
+    r = session.get(buy_page_url, headers={
+        "User-Agent": UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }, timeout=15)
     
-    payload = {
-        "appid": "1450015065", "midas_sdk": "0", "currency_type": "USD",
-        "country": "US", "midasbuyArea": "NorthAmerica", "sc": "",
-        "from": "self.midasbuy_saas", "task_token": "",
-        "pf": "mds_pc_browser-v3-android-midasweb-midasbuy-self.midasbuy_saas",
-        "zoneid": "1", "_id": f"0.{random.random()}",
-        "drm_info": f"groupid=check_in&area=NorthAmerica&country=US&muid={muid}&version=3.0&midasbuyArea=NorthAmerica",
-        "shopcode": "midasbuy",
-        "cgi_extend": f"device_id={device_id}&pagetoken={pagetoken}&tdrc_fp={tdrc_fp}&muid={muid}",
-        "buyType": "redeem",
-        "cgi_extend_obj": {"device_id": device_id, "pagetoken": pagetoken, "tdrc_fp": tdrc_fp, "muid": muid},
-        "expParams": exp_params, "openid": pubg_id
+    # Look for xMidasToken in various forms
+    m_tok = re.search(r'id="xMidasToken"[^>]*value="([^"]+)"', r.text)
+    if not m_tok:
+        m_tok = re.search(r'value="([0-9a-f]{90,})"[^>]*id="xMidasToken"', r.text)
+    if not m_tok:
+        m_tok = re.search(r'xMidasTokenInput\.value\s*=\s*"([^"]+)"', r.text)
+    
+    # If not found, fetch from xmidas-sdk.js
+    if not m_tok:
+        r2 = session.get(XMIDAS_SDK_URL, headers={
+            "User-Agent": UA, "Referer": buy_page_url}, timeout=15)
+        m_tok = re.search(r'xMidasTokenInput\.value\s*=\s*"([^"]+)"', r2.text)
+    
+    if not m_tok:
+        raise RuntimeError("Could not extract ctoken from page or SDK")
+    
+    ctoken = m_tok.group(1)
+    sk = session_key_from_ctoken(ctoken)
+    server_country = session.cookies.get("country", domain="www.midasbuy.com")
+    
+    return {
+        "ctoken": ctoken,
+        "sk": sk,
+        "server_country": server_country,
+        "url": buy_page_url
     }
-    
-    encrypted_msg = encrypt_payload(payload, session_key)
-    
-    response = requests.post(CHARACTER_API_URL, 
-                            json={
-                                "encrypt_msg": encrypted_msg,
-                                "ctoken_ver": "1.0.1",
-                                "ctoken": XMIDAS_TOKEN
-                            }, 
-                            headers=HEADERS, 
-                            impersonate="chrome120",
-                            timeout=30)
-    
-    result = response.json()
-    
-    if result.get("ret") == 0:
-        info = result["info"]
-        return {
-            "zone_id": info.get("zoneid"),
-            "open_id": info.get("openid"),
-            "character_name": unquote(info.get("charac_name", "")),
-            "active_country": info.get("active_country"),
-            "register_country": info.get("register_country"),
-            "is_banned": info.get("is_ban"),
-            "success": True
-        }
-    return {"success": False, "error": result.get("msg", "Account not found"), "ret": result.get("ret")}
 
-def lookup_redeem_code(redeem_code, open_id):
-    session_key = get_session_key(XMIDAS_TOKEN)
-    device_id, pagetoken, tdrc_fp, muid, user_id = generate_params()
-    user_ip = f"{random.randint(1,255)}.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(0,255)}"
-    
-    exp_params = b64encode(json.dumps({
-        "exp_id": "",
-        "exp_group_id": "",
-        "scene_id": "midasbuy.new_ui",
-        "device_id": device_id,
-        "shop_code": "midasbuy",
-        "muid": muid
-    }, separators=(',', ':')).encode()).decode()
-    
-    payload = {
-        "appid": "1450015065",
-        "midas_sdk": "0",
-        "currency_type": "USD",
-        "country": "US",
-        "midasbuyArea": "NorthAmerica",
-        "sc": "",
-        "from": "",
-        "task_token": "",
-        "pf": "mds_pc_browser-v3-android-midasweb-midasbuy-self",
-        "zoneid": "1",
-        "_id": f"0.{random.random()}",
-        "drm_info": f"groupid=check_in&area=NorthAmerica&country=US&muid={muid}&version=3.0&midasbuyArea=NorthAmerica",
-        "shopcode": "midasbuy",
-        "cgi_extend": f"device_id={device_id}&pagetoken={pagetoken}&tdrc_fp={tdrc_fp}&muid={muid}",
-        "buyType": "redeem",
-        "cgi_extend_obj": {
-            "device_id": device_id,
-            "pagetoken": pagetoken,
-            "tdrc_fp": tdrc_fp,
-            "muid": muid
-        },
-        "expParams": exp_params,
-        "redeem_code": redeem_code,
-        "subchannel": "MIDASBUY_REDEEM",
-        "direct_redeem": "1",
-        "offer_id": "1450015065",
-        "platform": "android",
-        "server_id": "1",
-        "region": "US",
-        "open_id": open_id,
-        "muid": muid,
-        "flexible_return_url": "https://www.midasbuy.com/h5/overseah5/views/riskcontrol/landing.html",
-        "user_ip": user_ip,
-        "role_id": "",
-        "language": "en",
-        "shop_code": "midasbuy",
-        "trpcPath": "/trpc.mbusiness.shelves_svr.Shelves/QueryRedeemCodeInfo"
-    }
-    
-    encrypted_msg = encrypt_payload(payload, session_key)
-    
-    response = requests.post(REDEEM_API_URL, 
-                            json={
-                                "encrypt_msg": encrypted_msg,
-                                "ctoken_ver": "1.0.1",
-                                "ctoken": XMIDAS_TOKEN
-                            }, 
-                            headers=HEADERS, 
-                            impersonate="chrome120",
-                            timeout=30)
-    
-    result = response.json()
-    
-    if result.get("ret") == 0:
-        info = result.get("redeem_code_info", {})
-        products = []
-        for p in info.get("products", []):
-            products.append({
-                "name": p.get("name", "N/A"),
-                "amount": p.get("game_coins_num", "N/A"),
-                "product_id": p.get("product_id", "N/A"),
-                "price_usd": p.get("price_usd")
-            })
+# ─── Main lookup functions ─────────────────────────────────────────
+
+def lookup_pubg_id(pubg_id: str, country: str = "us") -> dict:
+    """Look up PUBG player info using fresh token"""
+    try:
+        # Create session
+        session = requests.Session(impersonate="chrome120")
         
-        vip_info = result.get("common_model_view_data", {}).get("model_view_vip_product", {})
-        vip_products = []
-        for vp in vip_info.get("vip_products", []):
-            vip_products.append({
-                "product_id": vp.get("product_id", "N/A"),
-                "max_gift_coin": vp.get("max_gift_coin", "N/A"),
-                "min_gift_coin": vp.get("mini_gift_coin", "N/A")
-            })
+        # Set initial cookies
+        device_id = gen_device_id()
+        tdrc_fp = gen_tdrc_fp()
+        muid = gen_muid()
         
-        return {
-            "success": True,
-            "redeem_code_info": {
-                "game_name": info.get("game_name", "N/A"),
-                "coin_name": info.get("coin_name", "N/A"),
-                "app_id": info.get("app_id", "N/A"),
-                "region": info.get("region", "N/A"),
-                "products": products
+        session.cookies.set("midasbuyDeviceId", device_id, domain="www.midasbuy.com")
+        session.cookies.set("UUID", tdrc_fp, domain="www.midasbuy.com")
+        session.cookies.set("country", country, domain="www.midasbuy.com")
+        session.cookies.set("select_country", country, domain="www.midasbuy.com")
+        session.cookies.set("shopcode", SHOP_CODE, domain="www.midasbuy.com")
+        session.cookies.set("select_cookie", "1", domain="www.midasbuy.com")
+        session.cookies.set("cookie_control", "1|1|1", domain="www.midasbuy.com")
+        
+        # Get fresh ctoken
+        ct = get_fresh_ctoken(session, country)
+        ctoken = ct["ctoken"]
+        sk = ct["sk"]
+        
+        # Use server country if available
+        if ct.get("server_country"):
+            country = ct["server_country"].lower()
+        
+        ci = get_country_info(country)
+        currency = ci["currency"]
+        area = ci["area"]
+        group_id = ci["group_id"]
+        
+        # Build payload
+        ts = int(time.time() * 1000)
+        pagetoken = make_pagetoken(ts)
+        exp_params = make_exp_params(device_id, muid)
+        drm_info = make_drm_info(muid, country, area, group_id)
+        
+        payload = {
+            "appid": APPID,
+            "midas_sdk": "0",
+            "currency_type": currency,
+            "country": country.upper(),
+            "midasbuyArea": area,
+            "sc": "",
+            "from": "self.midasbuy_saas",
+            "task_token": "",
+            "pf": "mds_pc_browser-v3-android-midasweb-midasbuy-self.midasbuy_saas",
+            "zoneid": "1",
+            "_id": f"0.{random.random()}",
+            "drm_info": drm_info,
+            "shopcode": SHOP_CODE,
+            "cgi_extend": f"device_id={device_id}&pagetoken={pagetoken}&tdrc_fp={tdrc_fp}&muid={muid}",
+            "cgi_extend_obj": {
+                "device_id": device_id,
+                "pagetoken": pagetoken,
+                "tdrc_fp": tdrc_fp,
+                "muid": muid
             },
-            "vip_info": vip_products,
-            "player_country": result.get("playerCountryCode")
+            "buyType": "redeem",
+            "expParams": exp_params,
+            "openid": pubg_id
         }
-    else:
-        return {"success": False, "error": result.get("msg", "Unknown error"), "ret": result.get("ret")}
+        
+        encrypted_msg = make_encrypted_body(payload, sk, ctoken)
+        
+        # Make request
+        buy_ref = f"https://www.midasbuy.com/midasbuy/{country}/buy/pubgm?from=self.midasbuy_saas"
+        response = session.post(
+            CHARACTER_API_URL,
+            json={
+                "encrypt_msg": encrypted_msg,
+                "ctoken_ver": "1.0.1",
+                "ctoken": ctoken
+            },
+            headers={
+                **HEADERS,
+                "Referer": buy_ref
+            },
+            timeout=30
+        )
+        
+        result = response.json()
+        
+        if result.get("ret") == 0:
+            info = result.get("info", {})
+            return {
+                "success": True,
+                "zone_id": info.get("zoneid"),
+                "open_id": info.get("openid"),
+                "character_name": unquote(info.get("charac_name", "")),
+                "active_country": info.get("active_country"),
+                "register_country": info.get("register_country"),
+                "is_banned": bool(info.get("is_ban")),
+                "country_used": country
+            }
+        
+        return {
+            "success": False,
+            "error": result.get("msg", "Account not found"),
+            "ret": result.get("ret"),
+            "country_used": country
+        }
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Request failed: {str(e)}"
+        }
+
+def lookup_redeem_code(redeem_code: str, open_id: str, country: str = "us") -> dict:
+    """Look up redeem code info using fresh token"""
+    try:
+        # Create session
+        session = requests.Session(impersonate="chrome120")
+        
+        # Generate IDs
+        device_id = gen_device_id()
+        tdrc_fp = gen_tdrc_fp()
+        muid = gen_muid()
+        user_id = gen_user_id()
+        user_ip = f"{random.randint(1,255)}.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(0,255)}"
+        
+        # Set cookies
+        session.cookies.set("midasbuyDeviceId", device_id, domain="www.midasbuy.com")
+        session.cookies.set("UUID", tdrc_fp, domain="www.midasbuy.com")
+        session.cookies.set("country", country, domain="www.midasbuy.com")
+        session.cookies.set("select_country", country, domain="www.midasbuy.com")
+        session.cookies.set("shopcode", SHOP_CODE, domain="www.midasbuy.com")
+        session.cookies.set("select_cookie", "1", domain="www.midasbuy.com")
+        session.cookies.set("cookie_control", "1|1|1", domain="www.midasbuy.com")
+        
+        # Get fresh ctoken
+        ct = get_fresh_ctoken(session, country)
+        ctoken = ct["ctoken"]
+        sk = ct["sk"]
+        
+        # Use server country if available
+        if ct.get("server_country"):
+            country = ct["server_country"].lower()
+        
+        ci = get_country_info(country)
+        currency = ci["currency"]
+        area = ci["area"]
+        group_id = ci["group_id"]
+        
+        # Build payload
+        ts = int(time.time() * 1000)
+        pagetoken = make_pagetoken(ts, open_id)
+        exp_params = make_exp_params(device_id, muid)
+        drm_info = make_drm_info(muid, country, area, group_id)
+        
+        payload = {
+            "appid": APPID,
+            "midas_sdk": "0",
+            "currency_type": currency,
+            "country": country.upper(),
+            "midasbuyArea": area,
+            "sc": "",
+            "from": "",
+            "task_token": "",
+            "pf": "mds_pc_browser-v3-android-midasweb-midasbuy-self",
+            "zoneid": "1",
+            "_id": f"0.{random.random()}",
+            "drm_info": drm_info,
+            "shopcode": SHOP_CODE,
+            "cgi_extend": f"device_id={device_id}&pagetoken={pagetoken}&tdrc_fp={tdrc_fp}&muid={muid}",
+            "buyType": "redeem",
+            "cgi_extend_obj": {
+                "device_id": device_id,
+                "pagetoken": pagetoken,
+                "tdrc_fp": tdrc_fp,
+                "muid": muid
+            },
+            "expParams": exp_params,
+            "redeem_code": redeem_code,
+            "subchannel": "MIDASBUY_REDEEM",
+            "direct_redeem": "1",
+            "offer_id": APPID,
+            "platform": "android",
+            "server_id": "1",
+            "region": country.upper(),
+            "open_id": open_id,
+            "muid": muid,
+            "flexible_return_url": "https://www.midasbuy.com/h5/overseah5/views/riskcontrol/landing.html",
+            "user_ip": user_ip,
+            "role_id": "",
+            "language": "en",
+            "shop_code": SHOP_CODE,
+            "trpcPath": "/trpc.mbusiness.shelves_svr.Shelves/QueryRedeemCodeInfo"
+        }
+        
+        encrypted_msg = make_encrypted_body(payload, sk, ctoken)
+        
+        # Make request
+        buy_ref = f"https://www.midasbuy.com/midasbuy/{country}/buy/pubgm?from=self.midasbuy_saas"
+        response = session.post(
+            REDEEM_API_URL,
+            json={
+                "encrypt_msg": encrypted_msg,
+                "ctoken_ver": "1.0.1",
+                "ctoken": ctoken
+            },
+            headers={
+                **HEADERS,
+                "Referer": buy_ref
+            },
+            timeout=30
+        )
+        
+        result = response.json()
+        
+        if result.get("ret") == 0:
+            info = result.get("redeem_code_info", {})
+            products = []
+            for p in info.get("products", []):
+                products.append({
+                    "name": p.get("name", "N/A"),
+                    "amount": p.get("game_coins_num", "N/A"),
+                    "product_id": p.get("product_id", "N/A"),
+                    "price_usd": p.get("price_usd")
+                })
+            
+            vip_info = result.get("common_model_view_data", {}).get("model_view_vip_product", {})
+            vip_products = []
+            for vp in vip_info.get("vip_products", []):
+                vip_products.append({
+                    "product_id": vp.get("product_id", "N/A"),
+                    "max_gift_coin": vp.get("max_gift_coin", "N/A"),
+                    "min_gift_coin": vp.get("mini_gift_coin", "N/A")
+                })
+            
+            return {
+                "success": True,
+                "country_used": country,
+                "redeem_code_info": {
+                    "game_name": info.get("game_name", "N/A"),
+                    "coin_name": info.get("coin_name", "N/A"),
+                    "app_id": info.get("app_id", "N/A"),
+                    "region": info.get("region", "N/A"),
+                    "products": products
+                },
+                "vip_info": vip_products,
+                "player_country": result.get("playerCountryCode")
+            }
+        
+        return {
+            "success": False,
+            "error": result.get("msg", "Unknown error"),
+            "ret": result.get("ret"),
+            "country_used": country
+        }
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Request failed: {str(e)}"
+        }
+
+# ─── Flask Routes ──────────────────────────────────────────────────
 
 @app.route('/', methods=['GET'])
 def docs():
     """API Documentation endpoint"""
     return jsonify({
-        "service": "PUBG Mobile Redeem Code LOOKUP API",
-        "version": "1.0.0",
-        "region": "US (North America)",
-        "currency": "USD",
+        "service": "PUBG Mobile Redeem Code API",
+        "version": "2.0.0",
+        "description": "Uses fresh ctoken generation from MidasBuy page",
+        "region": "Auto-detected from MidasBuy",
         "endpoints": {
             "/": {
                 "methods": ["GET"],
@@ -228,21 +436,16 @@ def docs():
                         "type": "string",
                         "required": True,
                         "description": "PUBG Mobile player ID (numeric)"
+                    },
+                    "country": {
+                        "type": "string",
+                        "required": False,
+                        "description": "Country code (us, bd, tr, etc.)",
+                        "default": "us"
                     }
                 },
                 "examples": {
-                    "GET": "/playerInfo?pubg_id=1234567890",
-                    "POST_JSON": {
-                        "method": "POST",
-                        "url": "/playerInfo",
-                        "headers": {"Content-Type": "application/json"},
-                        "body": {"pubg_id": "1234567890"}
-                    },
-                    "POST_FORM": {
-                        "method": "POST",
-                        "url": "/playerInfo",
-                        "body": "pubg_id=1234567890"
-                    }
+                    "GET": "/playerInfo?pubg_id=1234567890&country=us"
                 },
                 "response": {
                     "success": {
@@ -252,7 +455,8 @@ def docs():
                             "character_name": "string",
                             "active_country": "string",
                             "register_country": "string",
-                            "is_banned": "boolean"
+                            "is_banned": "boolean",
+                            "country_used": "string"
                         }
                     },
                     "error": {
@@ -274,25 +478,21 @@ def docs():
                         "type": "string",
                         "required": True,
                         "description": "Redeem code to lookup"
+                    },
+                    "country": {
+                        "type": "string",
+                        "required": False,
+                        "description": "Country code (us, bd, tr, etc.)",
+                        "default": "us"
                     }
                 },
                 "examples": {
-                    "GET": "/codeInfo?open_id=1234567890&redeem_code=CODE123",
-                    "POST_JSON": {
-                        "method": "POST",
-                        "url": "/codeInfo",
-                        "headers": {"Content-Type": "application/json"},
-                        "body": {"open_id": "1234567890", "redeem_code": "CODE123"}
-                    },
-                    "POST_FORM": {
-                        "method": "POST",
-                        "url": "/codeInfo",
-                        "body": "open_id=1234567890&redeem_code=CODE123"
-                    }
+                    "GET": "/codeInfo?open_id=1234567890&redeem_code=CODE123&country=us"
                 },
                 "response": {
                     "success": {
                         "data": {
+                            "country_used": "string",
                             "redeem_code_info": {
                                 "game_name": "string",
                                 "coin_name": "string",
@@ -317,27 +517,25 @@ def docs():
                     }
                 }
             }
-        }}), 200
+        }
+    }), 200
 
 @app.route('/playerInfo', methods=['GET', 'POST'])
 def get_player_info():
-    """
-    Get player information by PUBG ID
-    Supports both GET and POST methods
-    
-    GET: /playerInfo?pubg_id=1234567890
-    POST: /playerInfo with JSON body {"pubg_id": "1234567890"}
-          or form data pubg_id=1234567890
-    """
+    """Get player information by PUBG ID"""
     try:
         # Extract pubg_id from request
         if request.method == 'GET':
             pubg_id = request.args.get('pubg_id')
+            country = request.args.get('country', 'us')
         else:
             if request.is_json:
-                pubg_id = request.json.get('pubg_id')
+                data = request.json
+                pubg_id = data.get('pubg_id')
+                country = data.get('country', 'us')
             else:
                 pubg_id = request.form.get('pubg_id')
+                country = request.form.get('country', 'us')
         
         # Validation
         if not pubg_id:
@@ -353,7 +551,7 @@ def get_player_info():
             }), 400
         
         # Look up character info
-        result = lookup_pubg_id(pubg_id)
+        result = lookup_pubg_id(pubg_id, country)
         
         if result.get("success"):
             return jsonify({
@@ -364,7 +562,8 @@ def get_player_info():
             return jsonify({
                 "success": False,
                 "error": result.get("error", "Account not found"),
-                "ret": result.get("ret")
+                "ret": result.get("ret"),
+                "country_used": result.get("country_used")
             }), 404
             
     except Exception as e:
@@ -375,27 +574,23 @@ def get_player_info():
 
 @app.route('/codeInfo', methods=['GET', 'POST'])
 def get_code_info():
-    """
-    Get redeem code information
-    Supports both GET and POST methods
-    
-    GET: /codeInfo?open_id=1234567890&redeem_code=CODE123
-    POST: /codeInfo with JSON body {"open_id": "1234567890", "redeem_code": "CODE123"}
-          or form data open_id=1234567890&redeem_code=CODE123
-    """
+    """Get redeem code information"""
     try:
         # Extract parameters from request
         if request.method == 'GET':
             open_id = request.args.get('open_id')
             redeem_code = request.args.get('redeem_code')
+            country = request.args.get('country', 'us')
         else:
             if request.is_json:
                 data = request.json
                 open_id = data.get('open_id')
                 redeem_code = data.get('redeem_code')
+                country = data.get('country', 'us')
             else:
                 open_id = request.form.get('open_id')
                 redeem_code = request.form.get('redeem_code')
+                country = request.form.get('country', 'us')
         
         # Validation
         if not open_id:
@@ -411,7 +606,7 @@ def get_code_info():
             }), 400
         
         # Look up redeem code info
-        result = lookup_redeem_code(redeem_code, open_id)
+        result = lookup_redeem_code(redeem_code, open_id, country)
         
         if result.get("success"):
             return jsonify({
@@ -422,7 +617,8 @@ def get_code_info():
             return jsonify({
                 "success": False,
                 "error": result.get("error", "Redeem code not found"),
-                "ret": result.get("ret")
+                "ret": result.get("ret"),
+                "country_used": result.get("country_used")
             }), 404
             
     except Exception as e:
@@ -430,7 +626,6 @@ def get_code_info():
             "success": False,
             "error": f"Internal server error: {str(e)}"
         }), 500
-
 
 @app.errorhandler(404)
 def not_found(error):
@@ -448,6 +643,9 @@ def method_not_allowed(error):
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("PUBG Mobile Redeem Code API Server")
-    
+    print("PUBG Mobile Redeem Code API Server (v2 - Fresh Token)")
+    print("=" * 60)
+    print("This API fetches fresh ctoken from MidasBuy page")
+    print("No static token required")
+    print("=" * 60)
     app.run(host='0.0.0.0', port=5000, debug=True)
